@@ -1,0 +1,6 @@
+# Generated datasets and downloaded raw data (recreated by the loading pipeline)
+/data/
+
+# Python bytecode
+__pycache__/
+*.py[cod]
