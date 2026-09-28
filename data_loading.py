@@ -2,8 +2,10 @@
 
 Run: python data_loading.py
 Requires pandas. Output is relative to this script, not the working directory.
-Only column selection, renaming, validated joins, and four-year weights are
-performed. Original response codes and missing values are preserved.
+Select and rename compatible variables, merge cycles, construct four-year
+weights, and select the study population before saving. Keep vaccination codes
+3/9, exclude prior HBV diagnosis code 1, and require age >= 6. Other response
+codes and missing laboratory results are preserved; no target is created.
 See DATA_LOADING.md for the dictionary, eligibility and compatibility decisions.
 """
 
@@ -53,7 +55,12 @@ VARIABLES = {
     },
     "IMQ": {"IMQ020": "hepatitis_b_vaccination"},
     "KIQ_U": {"KIQ022": "kidney_failure_history", "KIQ025": "dialysis"},
-    "HEQ": {"HEQ030": "hepatitis_c_history"},
+    "HEQ": {
+        # HEQ010: self-reported professional diagnosis history; cohort filter.
+        # Both cycles: 1 yes, 2 no, 7 refused, 9 don't know; ages 6+.
+        "HEQ010": "previous_hbv_diagnosis",
+        "HEQ030": "hepatitis_c_history",
+    },
     "HIQ": {"HIQ011": "health_insurance"},
     "MCQ": {
         "MCQ092": "blood_transfusion_history",
@@ -74,6 +81,7 @@ REQUIRED = {
     "participant_id", "survey_cycle_code", "interview_weight_2yr",
     "mec_weight_2yr", "survey_psu", "survey_stratum",
     "hbv_core_antibody", "hbv_surface_antigen", "hbv_surface_antibody",
+    "previous_hbv_diagnosis", "hepatitis_b_vaccination", "age",
 }
 
 
@@ -189,6 +197,53 @@ def build_dataset(reader=download_source):
     return result
 
 
+def filter_study_population(frame):
+    """Apply the agreed cohort rules without recoding responses or weights.
+
+    Keep IMQ020=3/9; exclude only HEQ010=1; keep age >=6.
+    Diagnosis refusal, unknown and missing remain eligible and retain their codes.
+    Missing age cannot establish eligibility and is counted separately.
+    Laboratory missingness and positivity do not determine eligibility here.
+    """
+    required = {"age", "hepatitis_b_vaccination", "previous_hbv_diagnosis"}
+    if required - set(frame.columns):
+        raise ValueError(f"Missing cohort columns: {sorted(required - set(frame.columns))}")
+    for column, allowed in {
+        "hepatitis_b_vaccination": {1, 2, 3, 7, 9},
+        "previous_hbv_diagnosis": {1, 2, 7, 9},
+    }.items():
+        unexpected = frame.loc[frame[column].notna() & ~frame[column].isin(allowed), column]
+        if not unexpected.empty:
+            raise ValueError(f"Unexpected codes in {column}: {unexpected.unique()}")
+    age = frame["age"]
+    if not pd.api.types.is_numeric_dtype(age):
+        raise ValueError("Age must be numeric")
+    if (age.notna() & (~age.ge(0) | ~age.lt(float("inf")))).any():
+        raise ValueError("Age must be finite and nonnegative when available")
+
+    flow = []
+    current = frame.copy()
+    flow.append({"step": "Combined participants", "excluded": 0, "remaining": len(current)})
+
+    def retain(mask, label):
+        nonlocal current
+        previous_count = len(current)
+        current = current.loc[mask.fillna(False)].copy()
+        flow.append({"step": label, "excluded": previous_count - len(current), "remaining": len(current)})
+
+    retain(current["hepatitis_b_vaccination"].isin([3, 9]), "Keep unvaccinated or vaccination unknown")
+    retain(~current["previous_hbv_diagnosis"].eq(1).fillna(False), "Exclude reported previous HBV diagnosis")
+    retain(current["age"].notna(), "Exclude missing age (eligibility unknown)")
+    retain(current["age"].ge(6), "Exclude age below 6")
+    for row in flow:
+        LOGGER.info("%s: excluded=%s, remaining=%s", row["step"], row["excluded"], row["remaining"])
+    if current.empty:
+        raise ValueError("No participants remain after cohort selection; output not replaced")
+    current = current.reset_index(drop=True)
+    current.attrs["cohort_flow"] = flow
+    return current
+
+
 def save_dataset(frame, output):
     """Replace the final file only after a complete CSV has been written."""
     output = Path(output).resolve()
@@ -220,10 +275,10 @@ def main():
         format="%(levelname)s: %(message)s"
     )
 
-    dataset = build_dataset()
+    dataset = filter_study_population(build_dataset())
 
     print("\n" + "=" * 60)
-    print("FINAL NHANES 2015-2018 DATASET")
+    print("FINAL NHANES 2015-2018 STUDY COHORT")
     print("=" * 60)
 
     print(f"\nDataset shape: {dataset.shape}")
