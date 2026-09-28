@@ -1,57 +1,141 @@
 import numpy as np
 import pandas as pd
+import polars as pl
 from sklearn.model_selection import train_test_split
 from sklearn.linear_model import LogisticRegression
 from sklearn.metrics import accuracy_score, confusion_matrix, classification_report, roc_auc_score, roc_curve, recall_score, precision_score
 from sklearn.preprocessing import StandardScaler
 import matplotlib.pyplot as plt
+from sklearn.impute import SimpleImputer
+import svy
 
-df = pd.read_csv("data/nhanes_2015_2018.csv")
+df = pd.read_csv("data/nhanes_2015_2018_clean.csv")
 
-# Preprocessing
-X = df.drop(columns=['SEQN', 'target_variable'])  # Replace 'target_variable' with the actual target column name
-y = df['target_variable']  # Replace 'target_variable' with the actual target column name
+exclude_columns = [
+    "participant_id",
+    "hbv_positive",
+    "hbv_positive_label",
+    "hbv_core_antibody",
+    "hbv_surface_antigen",
+    "hbv_surface_antibody",
+    "hbv_core_antibody_label",
+    "hbv_surface_antigen_label",
+    "hbv_surface_antibody_label",
+]
 
-# Split the data into training and testing sets
-X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=0.2, random_state=42)
+# Convert target and weights to numeric
+target = pd.to_numeric(df["hbv_positive"], errors="coerce")
+weights = pd.to_numeric(df["mec_weight_4yr"], errors="coerce")
 
-# Scale features
-scaler = StandardScaler()
-X_train = scaler.fit_transform(X_train)
-X_test = scaler.transform(X_test)
+# Remove missing/undetermined outcomes and invalid weights
+df = df[df["hbv_positive"].isin([0, 1]) & df["mec_weight_4yr"].notna() & (df["mec_weight_4yr"] > 0)].copy()
 
-# Train the logistic regression model
-model = LogisticRegression(max_iter=1000)
-model.fit(X_train, y_train)
+# Keep only definitive HBV outcomes and valid MEC weights
+valid_rows = (
+    target.isin([0, 1])
+    & weights.notna()
+    & np.isfinite(weights)
+    & (weights > 0)
+)
 
-# Make predictions on the test set
-y_pred = model.predict(X_test)
-y_pred_proba = model.predict_proba(X_test)[:, 1]
+# Use the complete eligible sample for survey inference
+df_model = df.loc[valid_rows].copy()
 
-# Evaluate the model
-accuracy = accuracy_score(y_test, y_pred)
-conf_matrix = confusion_matrix(y_test, y_pred)
-class_report = classification_report(y_test, y_pred)
-recall = recall_score(y_test, y_pred)
-precision = precision_score(y_test, y_pred)
-roc_auc = roc_auc_score(y_test, y_pred_proba)
+# Remove refused/don't know responses for categorical variables
+invalid_codes = [7, 9]
 
-print(f"Accuracy: {accuracy}")
-print(f"Confusion Matrix:\n{conf_matrix}")
-print(f"Classification Report:\n{class_report}")
-print(f"Recall: {recall}")
-print(f"Precision: {precision}")
-print(f"ROC AUC: {roc_auc}")
+for column in [
+    "sex",
+    "race_ethnicity",
+    "education",
+    "ever_injected_drugs",
+    "health_insurance",
+]:
+    df_model.loc[df_model[column].isin(invalid_codes), column] = np.nan
 
-# Plot ROC curve
-fpr, tpr, thresholds = roc_curve(y_test, y_pred_proba)
-plt.figure()
-plt.plot(fpr, tpr, label=f'ROC curve (area = {roc_auc:.2f})')
-plt.plot([0, 1], [0, 1], 'k--')  # Diagonal line
-plt.xlim([0.0, 1.0])
-plt.ylim([0.0, 1.05])
-plt.xlabel('False Positive Rate')
-plt.ylabel('True Positive Rate')
-plt.title('Receiver Operating Characteristic (ROC) Curve')
-plt.legend()
-plt.show()
+# Keep the survey sample complete for every variable used by the GLM.
+# This prevents svy margins from converting missing categorical values to 0.
+model_columns = [
+    "hbv_positive",
+    "mec_weight_4yr",
+    "survey_stratum",
+    "survey_psu",
+    "age",
+    "sex",
+    "race_ethnicity",
+    "education",
+    "poverty_income_ratio",
+    "ever_injected_drugs",
+    "health_insurance",
+]
+df_model = df_model.dropna(subset=model_columns).copy()
+
+# svy expects a Polars DataFrame
+survey_data = pl.from_pandas(df_model)
+
+design = svy.Design(
+    wgt="mec_weight_4yr",
+    stratum="survey_stratum",
+    psu="survey_psu",
+)
+
+sample = svy.Sample(
+    data=survey_data,
+    design=design,
+)
+
+survey_fit = sample.glm.fit(
+    y="hbv_positive",
+    x=[
+        "age",
+        svy.Cat("sex"),
+        svy.Cat("race_ethnicity"),
+        svy.Cat("education"),
+        "poverty_income_ratio",
+        svy.Cat("ever_injected_drugs"),
+        svy.Cat("health_insurance"),
+    ],
+    family="binomial",
+    drop_nulls=True
+)
+
+# Predict the probability of HBV positivity for every participant in the
+# complete-case survey sample.
+prediction_table = survey_fit.predict(survey_data).to_polars()
+predicted_data = survey_data.select(
+    ["participant_id", "hbv_positive"]
+).with_columns(
+    prediction_table["yhat"].alias("predicted_hbv_probability"),
+    prediction_table["lci"].alias("probability_lci"),
+    prediction_table["uci"].alias("probability_uci"),
+)
+
+print("Participant-level predicted probabilities:")
+print(predicted_data.head(10))
+predicted_data.write_csv("data/hbv_probability_predictions.csv")
+
+# Average marginal effects are changes in predicted probability. Continuous
+# variables report the change per unit; categorical variables report the
+# probability difference between the displayed levels.
+marginal_tables = []
+for variable in [
+    "age",
+    "sex",
+    "race_ethnicity",
+    "education",
+    "poverty_income_ratio",
+    "ever_injected_drugs",
+    "health_insurance",
+]:
+    marginal_tables.extend(
+        margin.to_polars()
+        for margin in survey_fit.margins(variables=[variable])
+    )
+
+marginal_effects = pl.concat(marginal_tables, how="diagonal")
+print("Average marginal probability changes:")
+print(marginal_effects)
+marginal_effects.write_csv("data/hbv_probability_marginal_effects.csv")
+
+
+print(survey_fit)
