@@ -1,12 +1,6 @@
 import numpy as np
 import pandas as pd
 import polars as pl
-from sklearn.model_selection import train_test_split
-from sklearn.linear_model import LogisticRegression
-from sklearn.metrics import accuracy_score, confusion_matrix, classification_report, roc_auc_score, roc_curve, recall_score, precision_score
-from sklearn.preprocessing import StandardScaler
-import matplotlib.pyplot as plt
-from sklearn.impute import SimpleImputer
 import svy
 
 df = pd.read_csv("data/nhanes_2015_2018_clean.csv")
